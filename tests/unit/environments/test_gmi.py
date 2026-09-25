@@ -1,37 +1,66 @@
-"""Offline unit tests for the GMI Sandbox environment; the SDK is faked."""
+"""Offline unit tests for the GMI environment; the SDK client is faked."""
 
 import asyncio
-import contextvars
-import io
 import logging
-import os
 import shlex
-import tarfile
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("sandbox_sdk", reason="requires the optional 'gmi' extra")
 
-from sandbox_sdk.errors import RateLimitError, TransportError  # noqa: E402
+from sandbox_sdk.errors import (  # noqa: E402
+    ConflictError,
+    NotFoundError,
+    RateLimitError,
+    ServerError,
+    TransportError,
+)
 
-from harbor.environments import gmi as gmi_harbor  # noqa: E402
-from harbor.environments.base import ExecResult  # noqa: E402
-from harbor.environments.gmi import GMIEnvironment  # noqa: E402
+from harbor.environments import gmi  # noqa: E402
+from harbor.environments.gmi import GMIEnvironment, GMIExecTimeoutError  # noqa: E402
 from harbor.models.task.config import EnvironmentConfig  # noqa: E402
 from harbor.models.trial.paths import TrialPaths  # noqa: E402
 
+IMAGE = "python:3.12-slim"
+RUNNING = {"status": "running"}
+STALE = ConflictError(
+    409,
+    "The template created by this idempotency key no longer exists; "
+    "use a new key to create another",
+)
+SANDBOX = {
+    "id": "sb-1",
+    "domain": "sandbox.test",
+    "sandbox_key": "key-1",
+    "sandbox_access_token": "token",
+}
+
+
+def done(exit_code=0, **fields):
+    return {
+        "status": "succeeded",
+        "exit_code": exit_code,
+        "stdout": "",
+        "stderr": "",
+        **fields,
+    }
+
+
+class Record:
+    def __init__(self, **data):
+        self.data = data
+
 
 class FakeExecution:
-    def __init__(self, states, execution_id="exec-1"):
-        self._states = list(states)
+    def __init__(self, states, refresh_errors, delay):
+        self._states = list(states) or [done()]
         self.data = self._states.pop(0)
-        self.execution_id = execution_id
-        self.refresh_calls = 0
-        self.cancel_calls = 0
-        self.cancel_error = None
+        self.execution_id = "exec-1"
+        self.cancels = 0
+        self._refresh_errors = refresh_errors
+        self._delay = delay
 
     status = property(lambda self: self.data.get("status"))
     exit_code = property(lambda self: self.data.get("exit_code"))
@@ -39,904 +68,611 @@ class FakeExecution:
     stderr = property(lambda self: self.data.get("stderr"))
 
     def refresh(self):
-        self.refresh_calls += 1
+        threading.Event().wait(self._delay)
+        if self._refresh_errors:
+            raise self._refresh_errors.pop(0)
         if self._states:
             self.data = self._states.pop(0)
         return self
 
     def cancel(self):
-        self.cancel_calls += 1
-        if self.cancel_error is not None:
-            raise self.cancel_error
-        return self
-
-
-def _done(exit_code=0, stdout="", stderr="", status="succeeded"):
-    return dict(status=status, exit_code=exit_code, stdout=stdout, stderr=stderr)
+        self.cancels += 1
 
 
 class FakeCommands:
-    def __init__(self, scripts=None):
-        self._scripts = list(scripts) if scripts else []
-        self.calls = []
-        self.executions = []
+    def __init__(self):
+        self.calls, self.executions = [], []
+        self.scripts, self.errors, self.refresh_errors = [], [], []
+        self.refresh_delay = 0.0
 
-    def run(self, command, *, envs=None, cwd=None, wait=False, **_kwargs):
-        self.calls.append({"command": command, "envs": envs, "cwd": cwd, "wait": wait})
-        states = self._scripts.pop(0) if self._scripts else [_done()]
-        execution = FakeExecution(states, execution_id=f"exec-{len(self.calls)}")
+    def run(self, command, *, envs=None, cwd=None, wait=False):
+        self.calls.append(
+            SimpleNamespace(command=command, envs=envs, cwd=cwd, wait=wait)
+        )
+        if self.errors:
+            raise self.errors.pop(0)
+        states = self.scripts.pop(0) if self.scripts else []
+        execution = FakeExecution(states, self.refresh_errors, self.refresh_delay)
         self.executions.append(execution)
         return execution
 
 
-class FakeFiles:
-    def __init__(self, contents=None):
-        self.contents = dict(contents or {})
-        self.writes = []
-
-    def write(self, path, content, **_kwargs):
-        self.writes.append((path, content))
-        self.contents[path] = content
-
-    def read(self, path, **_kwargs):
-        return self.contents[path]
-
-
-class FakeSandbox:
-    def __init__(self, scripts=None, contents=None, data=None):
-        self.commands = FakeCommands(scripts)
-        self.files = FakeFiles(contents)
-        self.data = {"sandbox_id": "sb-1"} if data is None else dict(data)
-        self.delete_calls = 0
-        self.delete_error = None
-
-    def delete(self):
-        self.delete_calls += 1
-        if self.delete_error is not None:
-            raise self.delete_error
-
-
-class FakeTemplateRecord:
-    def __init__(self, data):
-        self.data = dict(data)
-
-
-class FakeTemplates:
-    def __init__(self, listed=None, create_results=None, get_states=None):
-        self._listed = [FakeTemplateRecord(item) for item in (listed or [])]
-        self._create_results = list(create_results or [])
-        self._get_states = list(get_states or [])
-        self.create_calls = []
-        self.list_calls = []
-        self.get_calls = []
-
-    def list(self, *, page=1, page_size=20, idc_name=None):
-        self.list_calls.append(dict(page=page, page_size=page_size, idc_name=idc_name))
-        start = (page - 1) * page_size
-        return SimpleNamespace(
-            items=list(self._listed[start : start + page_size]),
-            total=len(self._listed),
-            page=page,
-            page_size=page_size,
+class FakeSandbox(Record):
+    def __init__(self, **data):
+        super().__init__(**{**SANDBOX, **data})
+        self.commands = FakeCommands()
+        self.files = SimpleNamespace(contents={})
+        self.files.write = lambda path, content: self.files.contents.__setitem__(
+            path, content
         )
-
-    def create(self, **kwargs):
-        self.create_calls.append(kwargs)
-        result = {"template_id": "tpl-created"}
-        if self._create_results:
-            result = self._create_results.pop(0)
-        if isinstance(result, Exception):
-            raise result
-        return FakeTemplateRecord(result)
-
-    def get(self, template_id, *, idc_name=None):
-        self.get_calls.append({"template_id": template_id, "idc_name": idc_name})
-        if len(self._get_states) > 1:
-            state = self._get_states.pop(0)
-        else:
-            state = self._get_states[0] if self._get_states else {}
-        return FakeTemplateRecord(state)
-
-
-class FakeSandboxes:
-    def __init__(self, sandbox=None, results=None):
-        self.sandbox = sandbox or FakeSandbox()
-        self._results = list(results or [])
-        self.create_calls = []
-
-    def create(self, **kwargs):
-        self.create_calls.append(kwargs)
-        result = self._results.pop(0) if self._results else self.sandbox
-        if isinstance(result, Exception):
-            raise result
-        return result
+        self.files.read = lambda path: self.files.contents[path]
 
 
 class FakeClient:
-    def __init__(self, templates=None, sandboxes=None):
-        self.templates = templates or FakeTemplates()
-        self.sandboxes = sandboxes or FakeSandboxes()
-        self.requests = []
-        self.request_error = None
+    """Enough of SandboxClient; `_request` serves the SDK's own Sandbox/Template.delete()."""
+
+    def __init__(self):
+        self.sandbox = FakeSandbox()
+        self.listed, self.build_states, self.sandbox_states = [], ["ready"], ["running"]
+        self.template_results, self.sandbox_results = [], []
+        self.template_creates, self.sandbox_creates, self.requests = [], [], []
+        self.templates = SimpleNamespace(
+            list=self._list_templates,
+            create=self._create_template,
+            get=self._get_template,
+        )
+        self.sandboxes = SimpleNamespace(
+            create=self._create_sandbox, get=self._get_sandbox
+        )
+
+    @staticmethod
+    def _next(queue, default):
+        result = queue.pop(0) if queue else default
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def _list_templates(self, *, page, page_size, idc_name=None):
+        chunk = self.listed[(page - 1) * page_size : page * page_size]
+        return SimpleNamespace(items=[Record(**item) for item in chunk])
+
+    def _create_template(self, **kwargs):
+        self.template_creates.append(kwargs)
+        return Record(**self._next(self.template_results, {"id": "tpl-new"}))
+
+    def _get_template(self, template_id, *, idc_name=None):
+        states = self.build_states
+        return Record(
+            id=template_id,
+            latest_build_status=states.pop(0) if len(states) > 1 else states[0],
+        )
+
+    def _create_sandbox(self, **kwargs):
+        self.sandbox_creates.append(kwargs)
+        return self._next(self.sandbox_results, self.sandbox)
+
+    def _get_sandbox(self, sandbox_id):
+        states = self.sandbox_states
+        return Record(
+            id=sandbox_id, state=states.pop(0) if len(states) > 1 else states[0]
+        )
 
     def _request(self, method, path, **kwargs):
-        self.requests.append({"method": method, "path": path, **kwargs})
-        if self.request_error is not None:
-            raise self.request_error
+        self.requests.append((method, path))
         return {}
 
-
-def make_env(**overrides):
-    env = object.__new__(GMIEnvironment)
-    env.environment_dir = overrides.pop("environment_dir", Path("/nonexistent"))
-    env.environment_name = overrides.pop("environment_name", "unit-test-task")
-    env.session_id = overrides.pop("session_id", "unit-test__abc__env")
-    env.task_env_config = overrides.pop("task_env_config", EnvironmentConfig())
-    env.logger = logging.getLogger("harbor.environments.gmi.tests")
-    env.default_user = overrides.pop("default_user", None)
-    env._persistent_env = overrides.pop("persistent_env", {})
-    env._exec_env_overlays = contextvars.ContextVar("overlays", default=())
-    env._prepared_cwds = set()
-    env._context_cache = {}
-    env._dockerfile_env_cache = None
-    env.trial_paths = overrides.pop(
-        "trial_paths", TrialPaths(trial_dir=Path("/nonexistent/job/trial"))
-    )
-    env._workdir = overrides.pop("workdir", None)
-    env._sandbox = overrides.pop("sandbox", None)
-    env._client = overrides.pop("client", None)
-    env._idc_name = overrides.pop("idc_name", "ce-tot")
-    env._template_id = overrides.pop("template_id", None)
-    for name, value in overrides.items():
-        setattr(env, name, value)
-    return env
-
-
-@pytest.fixture(autouse=True)
-def clean_module_state(monkeypatch):
-    for name in (
-        "GMI_SANDBOX_API_KEY",
-        gmi_harbor._DEFAULT_TEMPLATE_ENV,
-        gmi_harbor._IDC_ENV,
-        gmi_harbor._SANDBOX_TIMEOUT_ENV,
-        gmi_harbor._DISABLE_SU_ENV,
-        gmi_harbor._TEMPLATE_PRODUCT_ENV,
-        gmi_harbor._TRANSIENT_ATTEMPTS_ENV,
-        gmi_harbor._CREATE_ATTEMPTS_ENV,
-    ):
-        monkeypatch.delenv(name, raising=False)
-    registry = gmi_harbor._TemplateLockRegistry
-    registry._locks.clear()
-    registry._users.clear()
-    registry._guard = None
-    gmi_harbor._FORCE_BUILT_ALIASES.clear()
-    yield
-    gmi_harbor._FORCE_BUILT_ALIASES.clear()
-    registry._locks.clear()
-    registry._users.clear()
+    @property
+    def deletes(self):
+        return [path for method, path in self.requests if method == "DELETE"]
 
 
 @pytest.fixture
-def sleeps(monkeypatch):
-    recorded = []
+def client(monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(gmi, "SandboxClient", lambda: fake)
+    monkeypatch.setenv("GMI_SANDBOX_IDC_NAME", "test-idc")
+    return fake
 
-    async def _instant(delay, result=None):
-        recorded.append(delay)
+
+@pytest.fixture(autouse=True)
+def no_waiting(monkeypatch):
+    real_sleep = asyncio.sleep
+
+    async def instant(delay, result=None):
+        await real_sleep(0)
         return result
 
-    monkeypatch.setattr(gmi_harbor.asyncio, "sleep", _instant)
-    return recorded
+    monkeypatch.setattr(asyncio, "sleep", instant)
+    monkeypatch.setattr(gmi.time, "sleep", lambda _delay: None)
 
 
-def _archive_names(blob):
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as archive:
-        return {name.lstrip("./") for name in archive.getnames()} - {""}
-
-
-def write_dockerfile(tmp_path, body):
-    (tmp_path / "Dockerfile").write_text(body, encoding="utf-8")
-    return tmp_path
-
-
-DOCKERFILE = """\
-FROM python:3.11-slim AS base
-ENV LANG=C.UTF-8 GREETING="hello world"
-ENV LEGACY_KEY legacy value here
-WORKDIR /app
-RUN apt-get update && apt-get install -y curl
-COPY . /app
-ADD extra.tar /opt
-RUN pip install -r requirements.txt
-"""
-
-
-def test_translate_dockerfile_maps_every_supported_instruction(tmp_path, monkeypatch):
-    monkeypatch.setenv(gmi_harbor._MAX_CONTEXT_ENV, "0")
-    env = make_env(environment_dir=write_dockerfile(tmp_path, DOCKERFILE))
-
-    image, commands, envs = env._translate_dockerfile()
-
-    assert image == "python:3.11-slim"  # the `AS base` stage alias is stripped
-    exports = (
-        'export LANG="C.UTF-8"; export GREETING="hello world"; '
-        'export LEGACY_KEY="legacy value here"; '
-    )
-    assert commands == [
-        "mkdir -p /app",  # WORKDIR becomes an explicit mkdir
-        exports + "cd /app && apt-get update && apt-get install -y curl",
-        exports + "cd /app && pip install -r requirements.txt",
-    ]
-    assert not any("COPY" in cmd or "extra.tar" in cmd for cmd in commands)
-    assert envs == {}
-
-
-def test_embedded_context_respects_the_server_env_budget(tmp_path, monkeypatch):
-    monkeypatch.setenv(gmi_harbor._MAX_CONTEXT_ENV, str(4 * 1024 * 1024))
-    body = "FROM ubuntu:22.04\nENV BIG=%s\nCOPY blob.bin /blob.bin\n" % ("x" * 200)
-    env_dir = write_dockerfile(tmp_path, body)
-    (env_dir / "blob.bin").write_bytes(os.urandom(400 * 1024))
-    env = make_env(environment_dir=env_dir)
-
-    assert env._embedded_context() is None
-    assert [copy.dest for copy in env._dockerfile_copies()] == ["/blob.bin"]
-
-
-def test_translate_dockerfile_scopes_env_to_the_commands_after_it(tmp_path):
-    body = (
-        "FROM ubuntu:22.04\n"
-        "ENV PHASE=first\n"
-        "RUN echo $PHASE\n"
-        "ENV PHASE=second\n"
-        "RUN echo $PHASE\n"
-    )
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    _, commands, envs = env._translate_dockerfile()
-
-    assert commands == [
-        'export PHASE="first"; echo $PHASE',
-        'export PHASE="second"; echo $PHASE',
-    ]
-    assert envs == {}
-
-
-def test_translate_dockerfile_leaves_inherited_values_to_the_shell(tmp_path):
-    body = "FROM ubuntu:22.04\nENV PATH=/tool:$PATH\nRUN which tool\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    _, commands, _ = env._translate_dockerfile()
-
-    assert commands == ['export PATH="/tool:$PATH"; which tool']
-
-
-def test_context_archive_does_not_follow_a_symlinked_directory(tmp_path):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "secret.txt").write_text("host secret\n", encoding="utf-8")
-    (tmp_path / "ctx").mkdir()
-    env_dir = write_dockerfile(tmp_path / "ctx", "FROM ubuntu:22.04\nCOPY . /app\n")
-    (env_dir / "link").symlink_to(outside, target_is_directory=True)
-
-    names = _archive_names(gmi_harbor._context_archive(env_dir))
-
-    assert "link" in names
-    assert "link/secret.txt" not in names
-    assert not any(name.endswith("secret.txt") for name in names)
-
-
-def test_add_refuses_an_archive_that_escapes_its_destination(tmp_path):
-    env_dir = write_dockerfile(tmp_path, "FROM ubuntu:22.04\nADD evil.tar /opt/\n")
-    with tarfile.open(env_dir / "evil.tar", "w") as archive:
-        info = tarfile.TarInfo("../etc/cron.d/pwn")
-        info.size = 0
-        archive.addfile(info, io.BytesIO(b""))
-    env = make_env(environment_dir=env_dir)
-
-    with pytest.raises(RuntimeError, match="ADD refuses evil.tar"):
-        env._translate_dockerfile()
-
-
-def test_dockerignore_keeps_excluded_files_out_of_the_context(tmp_path):
-    body = "FROM ubuntu:22.04\nCOPY . /app/\n"
-    env_dir = write_dockerfile(tmp_path, body)
-    (env_dir / ".dockerignore").write_text(
-        "secrets\n*.key\n!keep.key\n", encoding="utf-8"
-    )
-    (env_dir / "secrets").mkdir()
-    (env_dir / "secrets" / "token.txt").write_text("s3cret\n", encoding="utf-8")
-    (env_dir / "drop.key").write_text("private\n", encoding="utf-8")
-    (env_dir / "keep.key").write_text("public\n", encoding="utf-8")
-    (env_dir / "app.py").write_text("print(1)\n", encoding="utf-8")
-
-    names = _archive_names(gmi_harbor._context_archive(env_dir))
-
-    assert "app.py" in names and "keep.key" in names
-    assert "secrets" not in names and "secrets/token.txt" not in names
-    assert "drop.key" not in names
-
-
-def record_staging(env):
-    """Capture what staging uploads and runs, without a sandbox."""
-    calls = {"uploads": [], "execs": []}
-
-    async def fake_upload_file(source_path, target_path):
-        calls["uploads"].append((Path(source_path), target_path))
-
-    async def fake_exec(command, cwd=None, env=None, timeout_sec=None, user=None):
-        calls["execs"].append({"command": command, "user": user})
-        return ExecResult(stdout="", stderr="", return_code=0)
-
-    env.upload_file = fake_upload_file
-    env.exec = fake_exec
-    return calls
-
-
-def test_copy_source_metacharacters_cannot_reach_the_shell(tmp_path, monkeypatch):
-    monkeypatch.setenv(gmi_harbor._MAX_CONTEXT_ENV, "0")
-    hostile = "a;touch pwned.txt"
-    env_dir = write_dockerfile(
-        tmp_path, f"FROM ubuntu:22.04\nCOPY {shlex.quote(hostile)} /app/\n"
-    )
-    (env_dir / hostile).write_text("x\n", encoding="utf-8")
-    env = make_env(environment_dir=env_dir)
-    calls = record_staging(env)
-
-    asyncio.run(env._stage_build_context())
-
-    copy = next(
-        call["command"] for call in calls["execs"] if "cp -a" in call["command"]
-    )
-    tokens = shlex.split(copy.split("&&")[-1])
-    assert tokens[:2] == ["cp", "-a"]
-    assert tokens[2].endswith(hostile)
-    assert f"'{tokens[2]}'" in copy
-
-
-def test_copy_does_not_follow_a_symlinked_directory(tmp_path, monkeypatch):
-    monkeypatch.setenv(gmi_harbor._MAX_CONTEXT_ENV, "0")
-    env_dir = write_dockerfile(tmp_path, "FROM ubuntu:22.04\nCOPY link /app/link\n")
-    (env_dir / "real").mkdir()
-    (env_dir / "real" / "f.txt").write_text("x\n", encoding="utf-8")
-    (env_dir / "link").symlink_to("/etc")
-    env = make_env(environment_dir=env_dir)
-    calls = record_staging(env)
-
-    asyncio.run(env._stage_build_context())
-
-    copy = next(
-        call["command"] for call in calls["execs"] if "cp -a" in call["command"]
-    )
-    assert "/link/." not in copy
-    assert copy.endswith("/link /app/link")
-
-
-def test_chmod_touches_only_what_the_instruction_copied(tmp_path, monkeypatch):
-    monkeypatch.setenv(gmi_harbor._MAX_CONTEXT_ENV, "0")
-    env_dir = write_dockerfile(
-        tmp_path, "FROM ubuntu:22.04\nCOPY --chmod=644 requirements.txt /\n"
-    )
-    (env_dir / "requirements.txt").write_text("flask\n", encoding="utf-8")
-    env = make_env(environment_dir=env_dir)
-    calls = record_staging(env)
-
-    asyncio.run(env._stage_build_context())
-
-    copy = next(c["command"] for c in calls["execs"] if "cp -a" in c["command"])
-    # The mode is set on the staged copy before `cp -a` carries it across, so
-    # nothing already at the destination is touched.
-    assert copy.index("chmod -R 644 ") < copy.index("cp -a")
-    assert "/requirements.txt && mkdir -p /" in copy
-    assert not copy.endswith("chmod -R 644 /")
-
-
-def test_exec_env_survives_the_sudo_wrapper():
-    sandbox = FakeSandbox()
-    env = make_env(sandbox=sandbox)
-
-    asyncio.run(env.exec("printenv TOKEN", env={"TOKEN": "sk-secret"}, user="root"))
-
-    command = sandbox.commands.calls[0]["command"]
-    assert "export TOKEN=sk-secret; printenv TOKEN" in command
-    assert command.startswith("sudo -n ")
-
-
-def test_dockerfile_env_reaches_the_running_sandbox(tmp_path):
-    env_dir = write_dockerfile(
-        tmp_path, "FROM python:3.11\nENV PATH=/opt/venv/bin:$PATH\n"
-    )
-    sandbox = FakeSandbox()
-    env = make_env(environment_dir=env_dir, sandbox=sandbox)
-
-    asyncio.run(env.exec("python -c 'import requests'", user="user"))
-
-    command = sandbox.commands.calls[0]["command"]
-    assert command.startswith('export PATH="/opt/venv/bin:$PATH"; ')
-
-
-def test_exec_creates_missing_cwd_once_as_root():
-    sandbox = FakeSandbox()
-    env = make_env(sandbox=sandbox)
-
-    asyncio.run(env.exec("first", cwd="/app"))
-    asyncio.run(env.exec("second", cwd="/app"))
-
-    prepare = sandbox.commands.calls[0]
-    assert "mkdir -p /app" in prepare["command"]
-    assert "test -d /app ||" in prepare["command"]
-    assert "chown user:user /app" in prepare["command"]
-    assert "chown -R" not in prepare["command"]
-    assert prepare["command"].startswith("sudo -n bash -c ")
-    assert prepare["cwd"] is None
-    assert len(sandbox.commands.calls) == 3
-    assert [call["cwd"] for call in sandbox.commands.calls[1:]] == ["/app", "/app"]
-
-
-def test_outer_cancellation_cancels_the_remote_command():
-    sandbox = FakeSandbox(scripts=[[{"status": "running"}]])
-    env = make_env(sandbox=sandbox)
-
-    async def scenario():
-        task = asyncio.create_task(env.exec("sleep 600", timeout_sec=600))
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            if sandbox.commands.executions:
-                break
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(scenario())
-
-    assert sandbox.commands.executions[0].cancel_calls == 1
-
-
-def test_create_deletes_a_sandbox_it_cannot_use():
-    bodies = [{"id": "uuid-1"}, {"id": "uuid-2"}, {"id": "u3", "sandbox_key": "k3"}]
-    created, deleted = [], []
-
-    class Sandboxes:
-        def create(self, **kwargs):
-            body = bodies[len(created)]
-            sandbox = FakeSandbox(data=body)
-            created.append(sandbox)
-            return sandbox
-
-    class Client:
-        def __init__(self):
-            self.sandboxes = Sandboxes()
-
-        def _request(self, method, path, **kwargs):
-            deleted.append((method, path))
-
-    env = make_env(client=Client())
-    sandbox = asyncio.run(env._create_sandbox("tpl-1", 60))
-
-    assert sandbox is created[-1]
-    assert deleted == [("DELETE", "/sandboxes/uuid-1"), ("DELETE", "/sandboxes/uuid-2")]
-
-
-def test_create_sandbox_waits_out_the_org_quota(sleeps, tmp_path):
-    good = FakeSandbox()
-    client = FakeClient(sandboxes=FakeSandboxes(good))
-    calls = []
-
-    def create(**kwargs):
-        calls.append(kwargs)
-        if len(calls) < 3:
-            raise RateLimitError(
-                429,
-                "sandbox quota exceeded: instance_type gmi.sandbox.small in "
-                "sandbox-runloop-us (5/5, requested 1)",
-            )
-        return good
-
-    client.sandboxes.create = create
-    env = make_env(environment_dir=tmp_path, client=client)
-
-    assert asyncio.run(env._create_sandbox("tpl-1", 300)) is good
-    assert len(calls) == 3
-    first = gmi_harbor._QUOTA_RETRY_INITIAL_SEC
-    assert sleeps == [first, first * 2]
-
-
-async def _await_flag(flag, timeout=5.0):
-    """Yield to the loop until a threading flag is set."""
-    waited = 0.0
-    while not flag.is_set():
-        if waited >= timeout:
-            raise AssertionError("blocking call never started")
-        await asyncio.sleep(0.01)
-        waited += 0.01
-
-
-def test_late_create_is_deleted_after_cancellation(monkeypatch):
-    monkeypatch.setattr(gmi_harbor, "_CREATE_CANCEL_CLEANUP_TIMEOUT_SEC", 0.05)
-    entered = threading.Event()
-    release = threading.Event()
-    sandbox = FakeSandbox(data={"id": "uuid-late", "sandbox_key": "sb-late"})
-
-    class BlockingSandboxes:
-        def create(self, **kwargs):
-            entered.set()
-            release.wait(timeout=5)
-            return sandbox
-
-    client = FakeClient(sandboxes=BlockingSandboxes())
-
-    async def scenario():
-        env = make_env(client=client)
-        task = asyncio.create_task(env._create_sandbox("tpl-1", 60))
-        await _await_flag(entered)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        release.set()
-        for _ in range(200):
-            if any(r["method"] == "DELETE" for r in client.requests):
-                break
-            await asyncio.sleep(0.01)
-        return env
-
-    env = asyncio.run(scenario())
-
-    deletes = [r for r in client.requests if r["method"] == "DELETE"]
-    assert deletes and deletes[0]["path"] == "/sandboxes/uuid-late"
-    assert env._sandbox is None  # never adopted, only reaped
-
-
-def _expected_alias(env):
-    """Derive the Template name the adapter will use for ``env``.
-
-    Computed through the production helper rather than restated here: the name
-    folds in the build payload, so hard-coding a formula silently drifts the
-    moment that payload changes.
-    """
-    image, commands, envs = env._translate_dockerfile()
-    resources = {"type": "preset", "product": gmi_harbor._template_product()}
-    build = gmi_harbor._compact_build(
-        {
-            "source": {"type": "image", "image": image},
-            "commands": commands or None,
-            "envs": envs or None,
-            # Mirrors production: an empty value is dropped, not sent as "".
-            "start_cmd": os.environ.get(
-                "HARBOR_GMI_START_CMD", gmi_harbor._DEFAULT_START_CMD
-            )
-            or None,
-        }
-    )
-    return gmi_harbor._template_alias(env.environment_id, resources, build)
-
-
-def _template_env(tmp_path, templates, dockerfile="FROM ubuntu:22.04\nRUN echo hi\n"):
-    write_dockerfile(tmp_path, dockerfile)
-    return make_env(environment_dir=tmp_path, client=FakeClient(templates))
-
-
-@pytest.mark.parametrize("existing_status", ["building", "pending", "in_progress"])
-def test_build_task_template_adopts_an_in_flight_build(
-    sleeps, tmp_path, existing_status
+def make_env(
+    path, *, dockerfile="FROM python:3.12-slim\nWORKDIR /app\n", files=(), **config
 ):
-    env = _template_env(tmp_path, FakeTemplates())
-    alias = _expected_alias(env)
-    env._client.templates = FakeTemplates(
-        listed=[
-            {
-                "name": alias,
-                "template_id": "tpl-inflight",
-                "latest_build_status": existing_status,
-            }
-        ],
-        get_states=[{"latest_build_status": "ready"}],
+    env_dir = path / "environment"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    if dockerfile is not None:
+        (env_dir / "Dockerfile").write_text(dockerfile)
+    for name in files:
+        (env_dir / name).write_text("services: {}\n")
+    kwargs = {
+        key: config.pop(key)
+        for key in ("template_id", "product", "mounts")
+        if key in config
+    }
+    config.setdefault("docker_image", IMAGE)
+    trial_paths = TrialPaths(trial_dir=path / "trial")
+    trial_paths.mkdir()
+    return GMIEnvironment(
+        environment_dir=env_dir,
+        environment_name="task",
+        session_id="task__abc__env",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(**config),
+        **kwargs,
     )
 
-    result = asyncio.run(env._build_task_template(force_build=False))
 
-    assert result == "tpl-inflight"
-    assert env._client.requests == []
-    assert env._client.templates.create_calls == []
+def ready_env(path, client):
+    env = make_env(path)
+    env._sandbox, env._sandbox_id = client.sandbox, "sb-1"
+    return env
+
+
+def alias_of(env):
+    resources = {"type": "preset", "product": env._product}
+    build = {"source": {"type": "image", "image": IMAGE}}
+    return gmi._template_alias(env.environment_id, resources, build)
+
+
+def keys(client):
+    return [create["idempotency_key"] for create in client.template_creates]
+
+
+async def eventually(predicate):
+    for _ in range(300):
+        if predicate():
+            return True
+        await asyncio.to_thread(threading.Event().wait, 0.01)
+    return predicate()
+
+
+# --- definition ---
+
+
+def test_dockerfile_only_task_is_rejected(tmp_path, client):
+    with pytest.raises(ValueError, match="docker_image"):
+        make_env(tmp_path, docker_image=None)
+
+
+def test_task_without_any_definition_is_rejected(tmp_path, client):
+    with pytest.raises(FileNotFoundError):
+        make_env(tmp_path, dockerfile=None, docker_image=None)
+
+
+def test_compose_task_is_rejected(tmp_path, client):
+    with pytest.raises(ValueError, match="Compose"):
+        make_env(tmp_path, files=["docker-compose.yaml"])
+
+
+def test_template_id_needs_no_other_definition(tmp_path, client):
+    make_env(tmp_path, dockerfile=None, docker_image=None, template_id="tpl-1")
+
+
+def test_workdir_variable_needs_an_explicit_workdir(tmp_path, client):
+    dockerfile = "FROM python:3.12-slim\nWORKDIR $APP_HOME\n"
+    with pytest.raises(ValueError, match="WORKDIR"):
+        make_env(tmp_path, dockerfile=dockerfile)
+    make_env(tmp_path / "ok", dockerfile=dockerfile, workdir="/srv")
 
 
 @pytest.mark.parametrize(
-    "error, retried",
-    [
-        (RateLimitError(429, "Too many concurrently active executions."), True),
-        (TransportError("_ssl.c:1015: The handshake operation timed out"), True),
-        (TransportError("The read operation timed out"), False),
-    ],
+    ("given", "expected"),
+    [(None, None), ("", None), (0, "0"), (12345, "12345"), ("t", "t")],
 )
-def test_dispatch_retries_only_what_never_reached_the_server(error, retried):
-    sandbox = FakeSandbox(scripts=[[_done(exit_code=0, stdout="hi")]])
-    calls = []
-    real_run = sandbox.commands.run
-
-    def flaky(command, **kwargs):
-        calls.append(command)
-        if len(calls) == 1:
-            raise error
-        return real_run(command, **kwargs)
-
-    sandbox.commands.run = flaky
-    env = make_env(sandbox=sandbox)
-
-    if retried:
-        assert asyncio.run(env.exec("echo hi")).return_code == 0
-        assert len(calls) == 2
-    else:
-        with pytest.raises(TransportError):
-            asyncio.run(env.exec("echo hi"))
-        assert len(calls) == 1
+def test_template_id_is_normalized(tmp_path, client, given, expected):
+    assert make_env(tmp_path, template_id=given)._template_id == expected
 
 
-def test_exec_env_values_stay_literal():
-    sandbox = FakeSandbox()
-    env = make_env(sandbox=sandbox)
-
-    asyncio.run(env.exec("echo", env={"X": "$HOME/bin"}, user="user"))
-
-    assert "export X='$HOME/bin'; " in sandbox.commands.calls[0]["command"]
+# --- templates ---
 
 
-@pytest.mark.parametrize(
-    "body", ["FROM ubuntu:22.04\nENV FOO;id=x\n", "FROM ubuntu:22.04\nARG A B=1\n"]
-)
-def test_env_names_that_are_not_identifiers_are_refused(tmp_path, body):
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    with pytest.raises(RuntimeError, match="invalid environment variable name"):
-        env._translate_dockerfile()
+def test_template_name_matches_the_previous_adapter():
+    # Same name, so Templates that the previous adapter built are reused.
+    resources = {"type": "preset", "product": "gmi.sandbox.medium"}
+    build = {"source": {"type": "image", "image": IMAGE}}
+    alias = gmi._template_alias("0123456789abcdef_0123456789abcdef", resources, build)
+    assert alias == "harbor-0123456789abcdef-012-1b21eff7"
 
 
-def test_exec_env_names_that_are_not_identifiers_are_refused():
-    env = make_env(sandbox=FakeSandbox())
-
-    with pytest.raises(RuntimeError, match="invalid environment variable name"):
-        asyncio.run(env.exec("id", env={"A;id": "1"}))
-
-
-def test_env_references_expand_at_declaration_like_docker(tmp_path):
-    body = "FROM ubuntu:22.04\nENV A=1\nENV B=$A\nENV A=2\nRUN echo\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    _, commands, _ = env._translate_dockerfile()
-
-    assert commands == ['export A="2"; export B="1"; echo']
-    assert env._dockerfile_env() == {"A": "2", "B": "1"}
+async def test_ready_template_is_reused(tmp_path, client):
+    env = make_env(tmp_path)
+    client.listed = [
+        {"id": "tpl-1", "name": alias_of(env), "latest_build_status": "ready"}
+    ]
+    assert await env._ensure_template() == "tpl-1"
+    assert client.template_creates == [] and client.deletes == []
 
 
-def test_arg_is_visible_to_build_commands_but_not_exported_at_runtime(tmp_path):
-    body = "FROM ubuntu:22.04\nARG PKG=curl\nENV LANG=C\nRUN apt-get install $PKG\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    _, commands, _ = env._translate_dockerfile()
-
-    assert commands == ['export LANG="C"; export PKG="curl"; apt-get install curl']
-    assert env._dockerfile_env() == {"LANG": "C"}
-
-
-def test_from_naming_an_earlier_stage_is_refused(tmp_path):
-    body = "FROM ubuntu:22.04 AS builder\nRUN make\nFROM builder\nRUN ./app\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    with pytest.raises(RuntimeError, match="names an earlier stage"):
-        env._translate_dockerfile()
+@pytest.mark.parametrize("status", ["building", "waiting", "", "something-new"])
+async def test_unfinished_template_is_awaited_not_deleted(tmp_path, client, status):
+    env = make_env(tmp_path)
+    client.listed = [
+        {"id": "tpl-1", "name": alias_of(env), "latest_build_status": status}
+    ]
+    client.build_states = ["building", "ready"]
+    assert await env._ensure_template() == "tpl-1"
+    assert client.template_creates == [] and client.deletes == []
 
 
-def test_copy_outside_the_build_context_is_refused(tmp_path):
-    body = "FROM ubuntu:22.04\nCOPY ../secret /etc/secret\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    with pytest.raises(RuntimeError, match="outside the build context"):
-        env._translate_dockerfile()
-
-
-def test_add_refuses_an_archive_containing_a_link(tmp_path):
-    archive = tmp_path / "x.tar"
-    with tarfile.open(archive, "w") as tar:
-        link = tarfile.TarInfo("etc")
-        link.type = tarfile.SYMTYPE
-        link.linkname = "."
-        tar.addfile(link)
-
-    with pytest.raises(RuntimeError, match="is a link"):
-        gmi_harbor._check_archive(archive)
+async def test_missing_template_is_built_from_the_image(tmp_path, client):
+    env = make_env(tmp_path)
+    assert await env._ensure_template() == "tpl-new"
+    [create] = client.template_creates
+    body = {k: v for k, v in create.items() if k != "idempotency_key"}
+    assert body == {
+        "name": alias_of(env),
+        "idc_name": "test-idc",
+        "resources": {"type": "preset", "product": "gmi.sandbox.small"},
+        "build": {"source": {"type": "image", "image": IMAGE}},
+        "description": "Harbor task task",
+    }
+    # A replayed key must carry the same body, so the key digests all of it.
+    assert create["idempotency_key"] == gmi._payload_key(alias_of(env), body)
 
 
-def test_cancelled_dispatch_cancels_the_command_it_started():
-    entered = threading.Event()
-    release = threading.Event()
-    execution = FakeExecution([{"status": "running"}])
-    sandbox = FakeSandbox()
+async def test_failed_template_is_rebuilt_under_the_next_key(tmp_path, client):
+    env = make_env(tmp_path)
+    client.listed = [
+        {"id": "tpl-bad", "name": alias_of(env), "latest_build_status": "failed"}
+    ]
+    # Deleting tpl-bad retired the first key.
+    client.template_results = [STALE, {"id": "tpl-new"}]
+    assert await env._ensure_template() == "tpl-new"
+    assert client.deletes == ["/templates/tpl-bad"]
+    first, second = keys(client)
+    assert second == f"{first}-1"
 
-    def blocking_run(command, **kwargs):
+
+async def test_retired_keys_are_skipped_in_a_fixed_order(tmp_path, client):
+    client.template_results = [STALE, STALE, {"id": "tpl-3"}]
+    assert await make_env(tmp_path)._ensure_template() == "tpl-3"
+    base = keys(client)[0]
+    assert keys(client) == [base, f"{base}-1", f"{base}-2"]
+
+
+async def test_running_out_of_keys_is_reported(tmp_path, client):
+    client.template_results = [STALE] * gmi._KEY_GENERATIONS
+    with pytest.raises(RuntimeError, match="retired"):
+        await make_env(tmp_path)._ensure_template()
+    assert len(keys(client)) == gmi._KEY_GENERATIONS
+    assert max(map(len, keys(client))) <= 64
+
+
+async def test_template_already_deleted_by_another_trial_is_quiet(
+    tmp_path, client, caplog
+):
+    env = make_env(tmp_path)
+    client.listed = [
+        {"id": "tpl-bad", "name": alias_of(env), "latest_build_status": "failed"}
+    ]
+
+    def already_gone(method, path, **kwargs):
+        raise NotFoundError(404, "template not found")
+
+    client._request = already_gone
+    with caplog.at_level(logging.WARNING):
+        assert await env._ensure_template() == "tpl-new"
+    assert "Failed to delete" not in caplog.text
+
+
+async def test_ready_copy_wins_among_duplicates(tmp_path, client):
+    env = make_env(tmp_path)
+    alias = alias_of(env)
+    client.listed = [
+        {"id": "a", "name": alias, "latest_build_status": "failed"},
+        {"id": "b", "name": alias, "latest_build_status": "ready"},
+        {"id": "c", "name": alias, "latest_build_status": "building"},
+    ]
+    assert await env._ensure_template() == "b"
+
+
+async def test_build_capacity_error_is_waited_out(tmp_path, client, caplog):
+    busy = RateLimitError(429, "maximum concurrent template builds reached")
+    client.template_results = [busy, {"id": "tpl-2"}]
+    with caplog.at_level(logging.WARNING):
+        assert await make_env(tmp_path)._ensure_template() == "tpl-2"
+    assert len(client.template_creates) == 2
+    assert "capacity is full" in caplog.text
+
+
+async def test_failed_build_is_reported(tmp_path, client):
+    client.build_states = ["failed"]
+    with pytest.raises(RuntimeError, match="ended as 'failed'"):
+        await make_env(tmp_path)._ensure_template()
+
+
+# --- sandbox lifecycle ---
+
+
+async def test_start_creates_and_prepares_the_sandbox(tmp_path, client):
+    mount = {"type": "bind", "source": str(tmp_path), "target": "/logs/agent"}
+    env = make_env(tmp_path, mounts=[mount])
+    await env.start(force_build=False)
+    [create] = client.sandbox_creates
+    assert create["template_id"] == "tpl-new" and create["timeout"] == 86_400
+    assert create["metadata"] == {
+        "harbor_environment": "task",
+        "harbor_session": "task__abc__env",
+    }
+    sshd, dirs = client.sandbox.commands.calls
+    assert "/run/sshd.pid" in sshd.command and sshd.cwd == "/"
+    assert (
+        "test -d /app" in dirs.command and "/logs/" in dirs.command and dirs.cwd == "/"
+    )
+
+
+async def test_force_build_is_ignored_with_a_warning(tmp_path, client, caplog):
+    with caplog.at_level(logging.WARNING):
+        await make_env(tmp_path).start(force_build=True)
+    assert "force_build is ignored" in caplog.text
+
+
+async def test_directory_setup_failure_fails_start(tmp_path, client):
+    client.sandbox.commands.scripts = [[done()], [done(exit_code=1, stderr="denied")]]
+    with pytest.raises(RuntimeError, match="prepare directories: denied"):
+        await make_env(tmp_path).start(force_build=False)
+
+
+async def test_create_retries_a_read_timeout_under_the_same_key(tmp_path, client):
+    client.sandbox_results = [
+        TimeoutError("The read operation timed out"),
+        client.sandbox,
+    ]
+    await make_env(tmp_path).start(force_build=False)
+    first, second = client.sandbox_creates
+    assert first["idempotency_key"] == second["idempotency_key"]
+
+
+async def test_quota_error_names_the_fix(tmp_path, client):
+    client.sandbox_results = [RateLimitError(429, "sandbox quota exceeded (5/5)")]
+    with pytest.raises(RuntimeError, match="Keep -n within"):
+        await make_env(tmp_path).start(force_build=False)
+
+
+async def test_sandbox_without_a_data_plane_endpoint_is_deleted(tmp_path, client):
+    client.sandbox_results = [FakeSandbox(sandbox_access_token=None)]
+    with pytest.raises(RuntimeError, match="data-plane"):
+        await make_env(tmp_path).start(force_build=False)
+    assert client.deletes == ["/sandboxes/sb-1"]
+
+
+async def test_cancelled_create_deletes_the_sandbox_that_lands_later(tmp_path, client):
+    env = make_env(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    create = client.sandboxes.create
+
+    def slow_create(**kwargs):
         entered.set()
-        release.wait(timeout=5)
-        return execution
+        release.wait(5)
+        return create(**kwargs)
 
-    sandbox.commands.run = blocking_run
-    env = make_env(sandbox=sandbox)
-
-    async def scenario():
-        task = asyncio.create_task(env.exec("sleep 600"))
-        await _await_flag(entered)
-        task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(scenario())
-
-    assert execution.cancel_calls == 1
-
-
-def test_cancelled_create_with_a_degraded_body_is_discarded():
-    entered = threading.Event()
-    release = threading.Event()
-    sandbox = FakeSandbox(data={"id": "uuid-degraded"})
-
-    class BlockingSandboxes:
-        def create(self, **kwargs):
-            entered.set()
-            release.wait(timeout=5)
-            return sandbox
-
-    client = FakeClient(sandboxes=BlockingSandboxes())
-
-    async def scenario():
-        env = make_env(client=client)
-        task = asyncio.create_task(env._create_sandbox("tpl-1", 60))
-        await _await_flag(entered)
-        task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return env
-
-    env = asyncio.run(scenario())
-
-    deletes = [r["path"] for r in client.requests if r["method"] == "DELETE"]
-    assert deletes == ["/sandboxes/uuid-degraded"]
+    client.sandboxes.create = slow_create
+    task = asyncio.create_task(env._create_sandbox("tpl-1"))
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await eventually(lambda: client.deletes == ["/sandboxes/sb-1"])
     assert env._sandbox is None
 
 
-def test_global_arg_survives_an_aliased_first_stage(tmp_path):
-    body = "ARG TAG=1\nFROM image:$TAG AS base\nARG TAG\nRUN echo $TAG\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    image, commands, _ = env._translate_dockerfile()
-
-    assert image == "image:1"
-    assert commands == ['export TAG="1"; echo 1']
+async def test_readiness_waits_through_starting_states(tmp_path, client):
+    client.sandbox_states = ["", "starting", "RUNNING"]
+    await make_env(tmp_path).start(force_build=False)
 
 
-def test_a_stage_arg_cannot_configure_a_later_from(tmp_path):
-    body = "FROM alpine\nARG TAG=1\nFROM image:$TAG\nRUN true\n"
-    env = make_env(environment_dir=write_dockerfile(tmp_path, body))
-
-    image, _, _ = env._translate_dockerfile()
-
-    assert image == "image:$TAG"
+async def test_sandbox_that_comes_up_failed_is_reported(tmp_path, client):
+    client.sandbox_states = ["failed"]
+    with pytest.raises(RuntimeError, match="came up as 'failed'"):
+        await make_env(tmp_path).start(force_build=False)
 
 
-def test_add_chmod_reaches_only_what_the_archive_held(tmp_path, monkeypatch):
-    monkeypatch.setenv(gmi_harbor._MAX_CONTEXT_ENV, "0")
-    env_dir = write_dockerfile(
-        tmp_path, "FROM ubuntu:22.04\nADD --chmod=644 tools.tar /usr/local/bin\n"
-    )
-    (env_dir / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
-    with tarfile.open(env_dir / "tools.tar", "w") as tar:
-        tar.add(env_dir / "tool", arcname="tool")
-    env = make_env(environment_dir=env_dir)
-    calls = record_staging(env)
-
-    asyncio.run(env._stage_build_context())
-
-    command = next(c["command"] for c in calls["execs"] if "tar -xf" in c["command"])
-    # Extracted into scratch beside the staged tree, moded there, then only
-    # its children are copied in: the destination directory keeps its own mode.
-    assert ".extract/tools.tar" in command
-    assert command.index("chmod -R 644 ") < command.index("find ")
-    assert "-exec cp -a -- {} /usr/local/bin/ \\;" in command
-    assert command.endswith(".extract/tools.tar")  # scratch removed afterwards
-    assert "rm -rf " in command
-    assert "chmod -R 644 /usr/local/bin" not in command
+async def test_stop_deletes_the_sandbox(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    await env.stop(delete=True)
+    assert client.deletes == ["/sandboxes/sb-1"] and env._sandbox is None
 
 
-def test_start_releases_the_platform_sshd_pidfile():
-    # The platform's own sshd owns /run/sshd.pid without needing it, and
-    # Debian's `service ssh start` treats the file as "already running".
-    sandbox = FakeSandbox()
-    env = make_env(sandbox=sandbox)
-
-    asyncio.run(env._release_sshd_pidfile())
-
-    command = sandbox.commands.calls[0]["command"]
-    assert command.startswith("sudo -n bash -c ")
-    assert "-e /run/sshd.pid" in command and command.endswith("rm -f /run/sshd.pid'")
+async def test_stop_keeps_the_sandbox_when_asked(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    await env.stop(delete=False)
+    assert client.deletes == [] and env._sandbox is None
 
 
-def test_copy_from_another_stage_is_refused(tmp_path):
-    env_dir = write_dockerfile(
-        tmp_path,
-        "FROM ubuntu:22.04 AS builder\nRUN make\nFROM ubuntu:22.04\n"
-        "COPY --from=builder /out /app\n",
-    )
-    env = make_env(environment_dir=env_dir)
+@pytest.mark.parametrize(
+    ("error", "logged"),
+    [(ServerError(500, "boom"), True), (NotFoundError(404, "gone"), False)],
+)
+async def test_stop_never_raises(tmp_path, client, caplog, error, logged):
+    env = ready_env(tmp_path, client)
 
-    with pytest.raises(RuntimeError, match="--from is not supported"):
-        env._translate_dockerfile()
+    def failing_request(method, path, **kwargs):
+        raise error
 
-
-def test_find_template_raises_rather_than_reporting_absent(monkeypatch):
-    # Reporting "absent" would make the caller build a duplicate under a name
-    # the org already holds.
-    monkeypatch.setattr(gmi_harbor, "_TEMPLATE_PAGE_LIMIT", 2)
-    full = [{"name": f"other-{n}", "id": f"t{n}"} for n in range(100)]
-    env = make_env(client=FakeClient(FakeTemplates(listed=full * 3)))
-
-    with pytest.raises(RuntimeError, match="cannot be shown to be absent"):
-        env._find_template("harbor-missing")
+    client._request = failing_request
+    with caplog.at_level(logging.ERROR):
+        await env.stop(delete=True)
+    assert ("Error stopping GMI sandbox sb-1" in caplog.text) is logged
+    assert env._sandbox is None
 
 
-def test_exec_reports_a_terminal_state_with_no_exit_code():
-    # Otherwise this is indistinguishable from the command returning 1.
-    sandbox = FakeSandbox(scripts=[[{"status": "error", "exit_code": None}]])
-    env = make_env(sandbox=sandbox)
+# --- exec ---
 
-    result = asyncio.run(env.exec("true"))
 
+@pytest.mark.parametrize(
+    ("user", "expected"),
+    [
+        (None, "sudo -n bash -c 'echo hi'"),
+        ("root", "sudo -n bash -c 'echo hi'"),
+        (0, "sudo -n bash -c 'echo hi'"),
+        ("user", "echo hi"),
+        ("agent", "sudo -n -u agent bash -c 'echo hi'"),
+        (1000, "sudo -n -u '#1000' bash -c 'echo hi'"),
+    ],
+)
+def test_users_other_than_the_sandbox_default_go_through_sudo(
+    tmp_path, client, user, expected
+):
+    assert make_env(tmp_path)._wrap("echo hi", None, user) == expected
+
+
+def test_env_is_exported_inside_sudo(tmp_path, client):
+    wrapped = make_env(tmp_path)._wrap("printenv A", {"A": "x y"}, None)
+    assert shlex.split(wrapped)[-1] == "export A='x y'; printenv A"
+
+
+@pytest.mark.parametrize("name", ["BAD-NAME", "FOO\n", "1X"])
+def test_invalid_env_names_are_rejected(tmp_path, client, name):
+    with pytest.raises(RuntimeError, match="invalid environment variable name"):
+        make_env(tmp_path)._wrap("true", {name: "v"}, None)
+
+
+async def test_exec_polls_until_the_command_finishes(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.scripts = [
+        [RUNNING, {"status": ""}, done(3, stdout="o", stderr="e")]
+    ]
+    result = await env.exec("false", env={"K": "v"})
+    assert (result.return_code, result.stdout, result.stderr) == (3, "o", "e")
+    [call] = client.sandbox.commands.calls
+    assert call.wait is False and call.cwd == "/app" and call.envs == {"K": "v"}
+
+
+async def test_missing_exit_code_is_reported(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.scripts = [[{"status": "timed_out", "exit_code": None}]]
+    result = await env.exec("sleep 1")
     assert result.return_code == 1
-    assert "ended as 'error'" in result.stderr
+    assert "execution ended as 'timed_out' with no exit code" in result.stderr
 
 
-@pytest.mark.parametrize("docker_image", [None, "python:3.12-slim"])
-def test_workdir_is_expanded_before_the_first_exec(tmp_path, monkeypatch, docker_image):
-    # Nothing else resolves `$APP_HOME` on the template_id and docker_image
-    # paths, so `_ensure_cwd` would create a directory of that literal name.
-    env_dir = write_dockerfile(
-        tmp_path, "FROM ubuntu:22.04\nENV APP_HOME=/srv/app\nWORKDIR $APP_HOME\n"
+async def test_own_timeout_cancels_the_command_and_is_not_a_timeout_error(
+    tmp_path, client
+):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.scripts = [[RUNNING]]
+    client.sandbox.commands.refresh_delay = 0.05
+    with pytest.raises(GMIExecTimeoutError) as caught:
+        await env.exec("sleep 100", timeout_sec=1)
+    assert not isinstance(caught.value, TimeoutError)
+    assert client.sandbox.commands.executions[0].cancels == 1
+
+
+async def test_cancelled_exec_cancels_the_command(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.scripts = [[RUNNING]]
+    client.sandbox.commands.refresh_delay = 0.01
+    task = asyncio.create_task(env.exec("sleep 100"))
+    assert await eventually(lambda: client.sandbox.commands.executions)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.sandbox.commands.executions[0].cancels == 1
+
+
+async def test_polling_rides_out_transient_failures(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.scripts = [[RUNNING, done()]]
+    client.sandbox.commands.refresh_errors = [TransportError("reset")] * 3
+    assert (await env.exec("true")).return_code == 0
+
+
+@pytest.mark.parametrize(
+    ("error", "attempts"),
+    [
+        (TransportError("[Errno 61] Connection refused"), 3),
+        (TransportError("timed out"), 3),
+        (RateLimitError(429, "Too many concurrently active executions."), 3),
+        (TimeoutError("The read operation timed out"), 1),
+    ],
+)
+async def test_dispatch_retries_only_what_never_arrived(
+    tmp_path, client, error, attempts
+):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.errors = [error] * 3
+    with pytest.raises((TransportError, RateLimitError)):
+        await env.exec("true")
+    assert len(client.sandbox.commands.calls) == attempts
+
+
+async def test_cancelled_dispatch_cancels_the_command_once_it_lands(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    commands = client.sandbox.commands
+    entered, release = threading.Event(), threading.Event()
+    run = commands.run
+
+    def slow_run(command, **kwargs):
+        entered.set()
+        release.wait(5)
+        return run(command, **kwargs)
+
+    commands.run = slow_run
+    task = asyncio.create_task(env.exec("sleep 100"))
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await eventually(
+        lambda: commands.executions and commands.executions[0].cancels == 1
     )
-    sandbox = FakeSandbox()
-    monkeypatch.setenv(gmi_harbor._IDC_ENV, "ce-tot")
-    monkeypatch.setattr(gmi_harbor, "SandboxClient", lambda: FakeClient())
-    trial_paths = TrialPaths(trial_dir=tmp_path / "job" / "trial")
-    trial_paths.mkdir()
-    env = GMIEnvironment(
-        environment_dir=env_dir,
-        environment_name="workdir-live",
-        session_id="workdir-live",
-        trial_paths=trial_paths,
-        task_env_config=EnvironmentConfig(docker_image=docker_image),
+
+
+async def test_sdk_calls_wrap_a_bare_timeout(tmp_path, client):
+    attempts = []
+
+    def read_times_out():
+        attempts.append(1)
+        raise TimeoutError("The read operation timed out")
+
+    with pytest.raises(TransportError, match="Probing failed"):
+        await make_env(tmp_path)._call("Probing", read_times_out)
+    assert len(attempts) == 2
+
+
+# --- files ---
+
+
+async def test_file_round_trip(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    (tmp_path / "a.bin").write_bytes(b"\x00\x01")
+    await env.upload_file(tmp_path / "a.bin", "/tmp/a.bin")
+    await env.download_file("/tmp/a.bin", tmp_path / "deep" / "b.bin")
+    assert (tmp_path / "deep" / "b.bin").read_bytes() == b"\x00\x01"
+
+
+async def test_upload_dir_unpacks_and_cleans_up_in_one_command(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    (tmp_path / "src" / "sub").mkdir(parents=True)
+    (tmp_path / "src" / "sub" / "f.txt").write_text("x")
+    await env.upload_dir(tmp_path / "src", "/data")
+    [archive] = client.sandbox.files.contents
+    script = shlex.split(client.sandbox.commands.calls[0].command)[-1]
+    assert "-C /data" in script and script.endswith(
+        f"; rc=$?; rm -f {archive}; exit $rc"
     )
-    env._sandbox = sandbox
-
-    assert env._workdir == "/srv/app"
-
-    asyncio.run(env.exec("pwd", user="user"))
-
-    assert sandbox.commands.calls[-1]["cwd"] == "/srv/app"
 
 
-def test_stop_reports_a_delete_that_missed_its_grace_window(caplog):
-    # This is the one path whose purpose is not leaking a sandbox, so a DELETE
-    # that never lands must leave a trace.
-    client = FakeClient()
-    client.request_error = TransportError("connection reset")
-    env = make_env(sandbox=FakeSandbox(), client=client)
-    env._control_plane_id = "6bf5f443-4ee8-4bf0-915e-04f4767a9b93"
-
-    with caplog.at_level(logging.WARNING):
-        asyncio.run(env.stop(delete=True))
-
-    assert "6bf5f443" in caplog.text
+async def test_upload_dir_failure_is_raised(tmp_path, client):
+    env = ready_env(tmp_path, client)
+    client.sandbox.commands.scripts = [[done(exit_code=2, stderr="no space")]]
+    with pytest.raises(RuntimeError, match="no space"):
+        await env.upload_dir(tmp_path, "/data")
 
 
-def test_dockerfile_env_reports_a_parse_failure(tmp_path, caplog):
-    # Commands would otherwise run without the task's ENV and nothing would say why.
-    env_dir = write_dockerfile(tmp_path, "FROM ubuntu:22.04\nRUN cat <<EOF\nx\nEOF\n")
-    env = make_env(environment_dir=env_dir)
-
-    with caplog.at_level(logging.WARNING):
-        assert env._dockerfile_env() == {}
-
-    assert "without it" in caplog.text
+async def test_upload_dir_needs_an_absolute_target(tmp_path, client):
+    with pytest.raises(ValueError, match="absolute"):
+        await ready_env(tmp_path, client).upload_dir(tmp_path, "")
