@@ -24,16 +24,6 @@ requires_gmi = pytest.mark.skipif(
 
 _IMAGE = "python:3.12-slim"
 
-_HELLO = "hello from the build context\n"
-
-_DOCKERFILE = (
-    f"FROM {_IMAGE}\n"
-    "ENV GREETING=hi\n"
-    "WORKDIR /app\n"
-    "COPY hello.txt .\n"
-    "RUN cat hello.txt > /built.txt\n"
-)
-
 
 def _make_live_env(
     tmp_path: Path,
@@ -116,22 +106,20 @@ async def test_file_round_trip(tmp_path):
 
 @requires_gmi
 @pytest.mark.asyncio
-async def test_dockerfile_build_copies_sets_env_and_workdir(tmp_path):
+async def test_prebuilt_image_takes_workdir_from_the_dockerfile(tmp_path):
+    # The Dockerfile only supplies WORKDIR: the image is never rebuilt, so
+    # force_build is ignored rather than rejected.
     env = _make_live_env(
         tmp_path,
-        EnvironmentConfig(),
-        files={"Dockerfile": _DOCKERFILE, "hello.txt": _HELLO},
+        EnvironmentConfig(docker_image=_IMAGE),
+        files={"Dockerfile": f"FROM {_IMAGE}\nWORKDIR /srv/app\n"},
     )
     try:
         await env.start(force_build=True)
 
-        # COPY ran inside the Build: the RUN after it read the copied file.
-        built = await env.exec("cat /built.txt")
-        assert built.return_code == 0
-        assert _stdout(built) == _HELLO.strip()
-
-        # ENV is replayed onto runtime commands; WORKDIR is the default cwd.
-        assert _stdout(await env.exec("printenv GREETING")) == "hi"
-        assert _stdout(await env.exec("pwd")) == "/app"
+        # start() created the WORKDIR the image lacks, owned by the sandbox user.
+        assert _stdout(await env.exec("pwd")) == "/srv/app"
+        assert _stdout(await env.exec("id -un", user="user")) == "user"
+        assert (await env.exec("touch probe", user="user")).return_code == 0
     finally:
         await env.stop(delete=True)
