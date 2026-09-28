@@ -239,15 +239,15 @@ class GMIEnvironment(BaseEnvironment):
 
     @override
     def _validate_definition(self) -> None:
+        if (self.environment_dir / COMPOSE_FILE_NAME).exists():
+            raise ValueError(
+                "Docker Compose tasks are not supported by the gmi environment."
+            )
         if self._template_id is not None:
             return
         require_agent_environment_definition(
             self.environment_dir, docker_image=self.task_env_config.docker_image
         )
-        if (self.environment_dir / COMPOSE_FILE_NAME).exists():
-            raise ValueError(
-                "Docker Compose tasks are not supported by the gmi environment."
-            )
         if not self.task_env_config.docker_image:
             raise ValueError(
                 "GMI sandboxes run prebuilt images, because a GMI Template build "

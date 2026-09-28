@@ -19,6 +19,7 @@ BUILD = {"source": {"type": "image", "image": IMAGE}}
 SANDBOX = dict(id="sb-1", domain="d", sandbox_key="k", sandbox_access_token="t")
 STALE = errors.ConflictError(409, "The template for this key no longer exists")
 DOCKERFILE = {"Dockerfile": "FROM x\nWORKDIR /app\n"}
+COMPOSE = {"docker-compose.yaml": "services: {}\n"}
 RUNNING = {"status": "running"}
 
 
@@ -117,6 +118,7 @@ async def cancel_while_blocked(target, result, start):
     [
         ({"docker_image": None}, ValueError, "docker_image"),
         ({"docker_image": None, "files": {}}, FileNotFoundError, None),
+        ({"files": COMPOSE, "template_id": "t"}, ValueError, "Compose"),
         ({"files": {"Dockerfile": "FROM x\nWORKDIR $APP\n"}}, ValueError, "WORKDIR"),
     ],
 )
