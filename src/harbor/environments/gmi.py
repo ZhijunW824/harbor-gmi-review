@@ -57,7 +57,8 @@ except ImportError:
 _IDC_ENV = "GMI_SANDBOX_IDC_NAME"
 _DEFAULT_PRODUCT = "gmi.sandbox.small"
 _SANDBOX_TIMEOUT_SEC = 86_400
-# Commands run as this unprivileged user by default, so root goes through sudo.
+# The sandbox runs commands as this unprivileged user; any other user, root
+# included, goes through sudo.
 _SANDBOX_USER = "user"
 # Task scripts use `source`, which dash does not provide.
 _SUDO_SHELL = "bash"
@@ -74,7 +75,8 @@ _READY_TIMEOUT_SEC = 180.0
 _READY_STATES = frozenset({"running", "ready", "active"})
 _NOT_READY_STATES = frozenset({"pending", "creating", "provisioning", "starting"})
 _EXEC_RUNNING = frozenset({"pending", "queued", "running"})
-# A failed status poll says nothing about the command, which keeps running.
+# How long exec keeps polling through errors: a failed status poll does not mean
+# the command failed.
 _POLL_FAILURE_BUDGET_SEC = 300.0
 
 _BUILD_CAPACITY_MARKERS = ("maximum concurrent template builds",)
@@ -82,7 +84,10 @@ _STALE_KEY_MARKERS = ("no longer exists", "use a new key")
 # Each deleted Template retires one idempotency key; see _create_template.
 _KEY_GENERATIONS = 8
 _SANDBOX_QUOTA_MARKERS = ("sandbox quota exceeded",)
-_QUOTA_HINT = "Keep -n within the org's sandbox quota, or ask GMI to raise it."
+_QUOTA_HINT = (
+    "Lower --n-concurrent to fit the organization's GMI sandbox quota, "
+    "or ask GMI Cloud to raise the quota."
+)
 # Connection-setup failures: the request never reached the server, so resending
 # a command cannot run it twice. The SDK reports all of them as TransportError.
 _DISPATCH_RETRYABLE_MARKERS = (
@@ -97,11 +102,17 @@ _DISPATCH_RETRYABLE_MARKERS = (
 
 
 class GMIExecTimeoutError(RuntimeError):
-    """A command outlived its timeout_sec; the trial renames a plain TimeoutError."""
+    """A command outlived its timeout_sec.
+
+    Not a TimeoutError: the trial would report one as a phase timeout.
+    """
 
 
 class _CreateHandoff:
-    """Whichever of the SDK thread and a cancelled caller comes second owns the sandbox."""
+    """Passes a new sandbox from the SDK thread to its caller.
+
+    If the caller is cancelled, whichever side acts second deletes the sandbox.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -126,7 +137,9 @@ def _matches(exc: BaseException, markers: tuple[str, ...]) -> bool:
 def _is_safe_to_redispatch(exc: BaseException) -> bool:
     if isinstance(exc, RateLimitError):
         return True
-    # A bare "timed out" is a TCP connect timeout; read timeouts say more.
+    # The SDK raises a connect timeout as TransportError("timed out"), before the
+    # request is sent. A read timeout is a TimeoutError, which _dispatch_command
+    # rewraps with a longer message, so it is never retried.
     return isinstance(exc, TransportError) and (
         str(exc).lower() == "timed out" or _matches(exc, _DISPATCH_RETRYABLE_MARKERS)
     )
@@ -139,8 +152,8 @@ def _digest(*parts: Any) -> str:
 
 
 def _template_alias(environment_id: str, *build_parts: Any) -> str:
-    task = environment_id[:_TEMPLATE_HASH_LEN].replace("_", "-")
-    return f"harbor-{task}-{_digest(*build_parts)[:_BUILD_HASH_LEN]}"
+    prefix = environment_id[:_TEMPLATE_HASH_LEN]
+    return f"harbor-{prefix}-{_digest(*build_parts)[:_BUILD_HASH_LEN]}"
 
 
 def _payload_key(alias: str, *parts: Any) -> str:
@@ -148,12 +161,17 @@ def _payload_key(alias: str, *parts: Any) -> str:
 
 
 class GMIEnvironment(BaseEnvironment):
-    """GMI Cloud sandboxes, booted from a prebuilt image or an existing Template.
+    """GMI Cloud sandboxes, started from a prebuilt image or an existing Template.
 
-    Needs GMI_SANDBOX_API_KEY and GMI_SANDBOX_IDC_NAME; kwargs ``template_id`` and
-    ``product`` (default gmi.sandbox.small). Template builds take no build context,
-    so Dockerfile tasks need ``docker_image``. ``force_build`` is ignored: delete
-    the task's ``harbor-*`` Template to pick up a re-pushed tag. Single container.
+    Requires GMI_SANDBOX_API_KEY and GMI_SANDBOX_IDC_NAME, the GMI data center
+    to run in. With ``template_id``, every sandbox starts from that Template.
+    Otherwise a Template is built from the task's ``docker_image`` and reused
+    across trials; ``product`` sets its size (default ``gmi.sandbox.small``).
+
+    A Template build accepts no build context, so a Dockerfile is read only for
+    its WORKDIR. ``force_build`` is ignored: to pick up a re-pushed image tag,
+    delete the Template described as ``Harbor task <name>``. Docker Compose
+    tasks are not supported.
     """
 
     @classmethod
@@ -168,8 +186,9 @@ class GMIEnvironment(BaseEnvironment):
             )
         if not os.environ.get(_IDC_ENV):
             raise SystemExit(
-                f"GMI sandboxes require {_IDC_ENV} to be set, naming the IDC "
-                "to run in. Please set this environment variable and try again."
+                f"GMI sandboxes require {_IDC_ENV} to be set to the GMI data "
+                "center (IDC) to run in. Please set this environment variable "
+                "and try again."
             )
 
     def __init__(
@@ -182,7 +201,7 @@ class GMIEnvironment(BaseEnvironment):
         if not _HAS_GMI:
             raise MissingExtraError(package="gmi-sandbox-sdk", extra="gmi")
         # Set before super().__init__(), which calls _validate_definition. --ek
-        # parses 12345 as an int and an empty value as "".
+        # turns template_id=12345 into an int and template_id= into "".
         self._template_id = None if template_id in (None, "") else str(template_id)
         self._product = product
         super().__init__(*args, **kwargs)
@@ -231,9 +250,9 @@ class GMIEnvironment(BaseEnvironment):
             )
         if not self.task_env_config.docker_image:
             raise ValueError(
-                "GMI sandboxes run prebuilt images: set [environment].docker_image "
-                "in task.toml (a GMI Template build has no channel for a build "
-                "context), or pass --ek template_id=<id>."
+                "GMI sandboxes run prebuilt images, because a GMI Template build "
+                "cannot take a build context. Set [environment].docker_image in "
+                "task.toml, or pass --ek template_id=<id>."
             )
 
     def _require_sandbox(self) -> Any:
@@ -285,7 +304,8 @@ class GMIEnvironment(BaseEnvironment):
             ]
             if len(items) < _TEMPLATE_PAGE_SIZE:
                 break
-        # Past the last page the create below still finds it, by idempotency key.
+        # A Template past the last scanned page is not lost: _create_template sends
+        # the same request and key, and the server returns the existing Template.
         rank = {"ready": 0, **dict.fromkeys(_BUILD_FAILED, 2)}
         return min(found, key=lambda t: rank.get(t[1], 1), default=(None, ""))
 
@@ -322,8 +342,8 @@ class GMIEnvironment(BaseEnvironment):
                 raise RuntimeError(f"Template create for {alias} returned no id")
             return str(created.data["id"])
         raise RuntimeError(
-            f"All {_KEY_GENERATIONS} idempotency keys for {alias} are retired; "
-            "each deleted Template retires one"
+            f"Cannot create template {alias}: all {_KEY_GENERATIONS} of its "
+            "idempotency keys belong to deleted Templates"
         )
 
     async def _await_build(self, template_id: str) -> None:
@@ -359,7 +379,9 @@ class GMIEnvironment(BaseEnvironment):
             )
         except NotFoundError:
             pass  # a concurrent trial deleted it first
-        except Exception as exc:  # noqa: BLE001 - a fresh build follows either way
+        except Exception as exc:  # noqa: BLE001 - best effort
+            # If the failed Template survives under our key, the create replays it
+            # and _await_build reports the failure.
             self.logger.warning(f"Failed to delete template {template_id}: {exc}")
 
     async def _create_sandbox(self, template_id: str) -> None:
@@ -397,7 +419,8 @@ class GMIEnvironment(BaseEnvironment):
                 raise RuntimeError(f"{exc}. {_QUOTA_HINT}") from exc
             raise
         data = sandbox.data
-        # The data plane is https://{sandbox_key}.{domain} plus the access token.
+        # Commands and files go to https://{sandbox_key}.{domain} with the access
+        # token; without these fields the sandbox is unreachable.
         if not all(
             data.get(k) for k in ("id", "domain", "sandbox_key", "sandbox_access_token")
         ):
@@ -408,7 +431,7 @@ class GMIEnvironment(BaseEnvironment):
         self._sandbox, self._sandbox_id = sandbox, data["id"]
 
     def _delete_now(self, sandbox_id: str) -> None:
-        """Blocking DELETE with its own retry, so a cancel mid-backoff cannot drop it."""
+        """Delete the sandbox, retrying in-thread so a cancel cannot cut it short."""
         for attempt in (1, 2):
             try:
                 Sandbox(self._client, {"id": sandbox_id}).delete()
@@ -425,8 +448,11 @@ class GMIEnvironment(BaseEnvironment):
             return
         try:
             self._delete_now(sandbox_id)
-        except Exception as exc:  # noqa: BLE001 - it bills until its own timeout
-            self.logger.warning(f"Could not delete GMI sandbox {sandbox_id}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+            self.logger.warning(
+                f"Could not delete GMI sandbox {sandbox_id}; it keeps running until "
+                f"its {_SANDBOX_TIMEOUT_SEC}s timeout: {exc}"
+            )
 
     async def _await_sandbox_ready(self) -> None:
         # Read state from a separate object: Sandbox.refresh() replaces all of its
@@ -452,8 +478,9 @@ class GMIEnvironment(BaseEnvironment):
             delay = min(delay * 2, 4.0)
 
     async def _release_sshd_pidfile(self) -> None:
-        # The platform's own sshd leaves /run/sshd.pid behind, which stops a task's
-        # `service ssh start` from starting sshd.
+        # The platform's own sshd writes /run/sshd.pid, possibly after the sandbox
+        # reports ready. While that file exists, a task's `service ssh start`
+        # assumes sshd is running, so wait up to 10 s for it and remove it.
         script = (
             "for _ in $(seq 1 20); do [ -e /run/sshd.pid ] && break; sleep 0.5; done; "
             "rm -f /run/sshd.pid"
@@ -461,7 +488,7 @@ class GMIEnvironment(BaseEnvironment):
         try:
             await self.exec(script, cwd="/", timeout_sec=60, user="root")
         except Exception as exc:  # noqa: BLE001 - best effort
-            self.logger.debug(f"Could not release /run/sshd.pid: {exc}")
+            self.logger.debug(f"Could not remove /run/sshd.pid: {exc}")
 
     @override
     async def start(self, force_build: bool) -> None:
@@ -473,8 +500,9 @@ class GMIEnvironment(BaseEnvironment):
         await self._create_sandbox(template_id)
         await self._await_sandbox_ready()
         await self._release_sshd_pidfile()
-        # One command for the working directory and the mount targets. An existing
-        # working directory keeps the permissions the image gave it.
+        # Create the working directory and the writable mount targets in one exec.
+        # A working directory from the image keeps its ownership; a new one is
+        # owned by the sandbox user.
         steps = []
         if cwd := effective_exec_cwd(None, self.task_env_config.workdir, self._workdir):
             q = shlex.quote(cwd)
@@ -504,8 +532,9 @@ class GMIEnvironment(BaseEnvironment):
             self._sandbox = None
             return
         try:
-            # An executor future, not a task, so neither a cancelled caller nor
-            # asyncio.run's shutdown can drop a DELETE that is still queued.
+            # shield() keeps a cancelled caller from cancelling the DELETE, and an
+            # executor job, unlike a task, is awaited rather than cancelled when
+            # asyncio.run shuts down.
             loop = asyncio.get_running_loop()
             await asyncio.shield(
                 loop.run_in_executor(None, self._delete_now, self._sandbox_id)
@@ -557,7 +586,7 @@ class GMIEnvironment(BaseEnvironment):
             for name in env:
                 if not _ENV_NAME.fullmatch(name):
                     raise RuntimeError(f"invalid environment variable name {name!r}")
-            # Sent on the request as well, but sudo resets the environment.
+            # The request carries these too, but sudo resets the environment.
             exports = "".join(f"export {k}={shlex.quote(v)}; " for k, v in env.items())
             command = exports + command
         requested = "root" if user is None else str(user)
@@ -580,7 +609,7 @@ class GMIEnvironment(BaseEnvironment):
     async def _dispatch_command(
         self, command: str, *, env: dict[str, str] | None, cwd: str | None
     ) -> Any:
-        """Start ``command`` without waiting; only provably undelivered sends are retried."""
+        """Start ``command`` detached; retry only errors proving it never started."""
         # The server holds a synchronous request for at most 25 seconds, so start
         # the command detached and poll for its result.
         dispatch = asyncio.create_task(
@@ -595,8 +624,9 @@ class GMIEnvironment(BaseEnvironment):
         try:
             return await asyncio.shield(dispatch)
         except asyncio.CancelledError:
-            # The command may have reached the sandbox. After an agent timeout the
-            # verifier runs in the same sandbox, so it must not keep running.
+            # The command may already have reached the sandbox. Cancel it once the
+            # dispatch returns: after an agent timeout the verifier runs in this
+            # sandbox, so the agent's command must not keep running.
             dispatch.add_done_callback(self._cancel_late_dispatch)
             raise
         except TimeoutError as exc:
@@ -610,7 +640,7 @@ class GMIEnvironment(BaseEnvironment):
 
     async def _wait_for_execution(self, execution: Any, timeout_sec: int | None) -> Any:
         loop = asyncio.get_running_loop()
-        # 0 means no limit, as in the docker, e2b and runloop environments.
+        # None and 0 both mean no limit.
         deadline = loop.time() + timeout_sec if timeout_sec else None
         delay = 0.2
         failing_since: float | None = None

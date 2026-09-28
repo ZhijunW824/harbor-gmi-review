@@ -55,7 +55,7 @@ def _files(root: Path) -> dict[Path, bytes]:
 
 @requires_gmi
 @pytest.mark.asyncio
-async def test_exec_contract(tmp_path):
+async def test_exec_user_env_and_exit_code(tmp_path):
     env = _make_live_env(tmp_path, EnvironmentConfig(docker_image=_IMAGE))
     try:
         await env.start(force_build=False)
