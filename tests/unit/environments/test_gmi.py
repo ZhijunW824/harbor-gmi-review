@@ -80,7 +80,8 @@ def list_templates(client, env, *templates):
     resources = {"type": "preset", "product": env._product}
     alias = gmi._template_alias(env.environment_id, resources, BUILD)
     items = [rec(id=i, name=alias, latest_build_status=s) for i, s in templates]
-    client.templates.list.return_value.items = items
+    other_task = rec(id="other-task", name="harbor-other", latest_build_status="ready")
+    client.templates.list.return_value.items = [other_task, *items]
 
 
 def deleted(client):
@@ -164,14 +165,18 @@ async def test_failed_template_is_rebuilt_under_the_next_key(tmp_path, client, c
     assert request.pop("idempotency_key") == rest[-1]
     assert base == gmi._payload_key(request["name"], request)
     assert request["build"] == BUILD and request["idc_name"] == "idc"
+    # Existing Templates are found by this name; it changes with the image.
+    assert request["name"] == "harbor-9c3c956a7072466ae9db-d459ee07"
 
 
 async def test_start_prepares_the_sandbox(tmp_path, client, caplog):
     mount = {"type": "bind", "source": str(tmp_path), "target": "/logs/agent"}
-    client.sandboxes.get.side_effect = [rec(state=s) for s in ("", "starting", "READY")]
+    states = [rec(state=s, latest_build_status=s) for s in ("", "starting", "READY")]
+    client.sandboxes.get.side_effect = client.templates.get.side_effect = states
     with caplog.at_level("WARNING"):
         await make_env(tmp_path, mounts=[mount]).start(force_build=True)
     assert "force_build is ignored" in caplog.text
+    assert client.templates.get.call_count == client.sandboxes.get.call_count == 3
     sshd, dirs = client.sandbox.commands.run.call_args_list
     assert "/run/sshd.pid" in sshd.args[0] and dirs.kwargs["cwd"] == "/"
     assert "test -d /app" in dirs.args[0] and "/logs/agent" in dirs.args[0]
@@ -183,6 +188,7 @@ async def test_sandbox_create(tmp_path, client):
     await make_env(tmp_path).start(force_build=False)
     first, second = client.sandboxes.create.call_args_list
     assert first.kwargs["idempotency_key"] == second.kwargs["idempotency_key"]
+    assert first.kwargs["timeout"] == 86_400 and first.kwargs["idc_name"] == "idc"
     # A bare TimeoutError would be reported as an environment start timeout.
     client.sandboxes.create.side_effect = [timeout, timeout]
     with pytest.raises(errors.TransportError, match="Creating sandbox failed"):
@@ -214,7 +220,9 @@ async def test_work_landing_after_a_cancel_is_undone(tmp_path, client):
     ],
 )
 async def test_stop_never_raises(tmp_path, client, caplog, delete, error, attempts):
-    env = make_env(tmp_path, sandbox=client.sandbox)
+    client.sandboxes.get.side_effect = RuntimeError("boot")  # start fails after create
+    with pytest.raises(RuntimeError, match="boot"):
+        await (env := make_env(tmp_path)).start(force_build=False)
     client._request.side_effect = error
     with caplog.at_level("ERROR"):
         await env.stop(delete=delete)
@@ -245,19 +253,20 @@ def test_env_is_exported_inside_sudo_and_names_are_checked(tmp_path, client):
 @pytest.mark.parametrize(
     ("states", "code", "stderr"),
     [
-        ([RUNNING, {"status": ""}, done(3, stderr="e")], 3, "e"),
-        ([{"status": "timed_out"}], 1, "ended as 'timed_out' with no exit code"),
+        ([RUNNING, {"status": ""}, done(3, stdout="o", stderr="e")], 3, "e"),
+        ([{"status": "timed_out", "stdout": "o"}], 1, "'timed_out' with no exit code"),
     ],
 )
 async def test_exec_result(tmp_path, client, states, code, stderr):
     # Failed polls say nothing about the command, so the wait goes on.
-    failures = [errors.TransportError("reset")] * 3
+    failures = [errors.TransportError("reset"), errors.RateLimitError(429, "slow")] * 2
     client.sandbox.commands.run.side_effect = [Execution(*states, poll_errors=failures)]
-    env = make_env(tmp_path, sandbox=client.sandbox)
+    env = make_env(tmp_path, sandbox=client.sandbox, env={"P": "1"})
     result = await env.exec("cmd", env={"K": "v"})
     assert result.return_code == code and stderr in result.stderr
+    assert result.stdout == "o"
     call = client.sandbox.commands.run.call_args
-    assert call.kwargs == {"envs": {"K": "v"}, "cwd": "/app", "wait": False}
+    assert call.kwargs == {"envs": {"P": "1", "K": "v"}, "cwd": "/app", "wait": False}
 
 
 async def test_command_is_cancelled_when_the_wait_ends_early(tmp_path, client):
@@ -279,22 +288,27 @@ async def test_command_is_cancelled_when_the_wait_ends_early(tmp_path, client):
         (errors.TransportError("timed out"), 3),
         (errors.RateLimitError(429, "Too many concurrently active executions."), 3),
         (TimeoutError("The read operation timed out"), 1),
+        (errors.ServerError(502, "Bad Gateway"), 1),
     ],
 )
 async def test_dispatch_retries_only_undelivered(tmp_path, client, error, attempts):
     client.sandbox.commands.run.side_effect = error
-    with pytest.raises((errors.TransportError, errors.RateLimitError)):
+    with pytest.raises(errors.SandboxSDKError):
         await make_env(tmp_path, sandbox=client.sandbox).exec("true")
     assert client.sandbox.commands.run.call_count == attempts
 
 
 async def test_file_transfer(tmp_path, client):
     env = make_env(tmp_path, sandbox=client.sandbox)
-    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "logs").mkdir(parents=True)
     await env.upload_dir(tmp_path / "src", "/data")
-    archive = client.sandbox.files.write.call_args.args[0]
+    archive, payload = client.sandbox.files.write.call_args.args
     script = shlex.split(client.sandbox.commands.run.call_args.args[0])[-1]
     assert "-C /data" in script and script.endswith(f"rm -f {archive}; exit $rc")
+    # Rewards come back through download_dir: serve the uploaded archive back.
+    client.sandbox.files.read.return_value = payload
+    await env.download_dir("/logs/verifier", tmp_path / "out")
+    assert (tmp_path / "out" / "logs").is_dir()
     client.sandbox.commands.run.side_effect = [Execution(done(2, stderr="no space"))]
     with pytest.raises(RuntimeError, match="no space"):
         await env.upload_dir(tmp_path / "src", "/data")

@@ -661,7 +661,7 @@ class GMIEnvironment(BaseEnvironment):
                         f"Polling execution {execution.execution_id}", execution.refresh
                     )
                     failing_since = None
-                except (TransportError, ServerError, OSError) as exc:
+                except (TransportError, ServerError, RateLimitError, OSError) as exc:
                     failing_since = failing_since or loop.time()
                     if loop.time() - failing_since > _POLL_FAILURE_BUDGET_SEC:
                         raise
