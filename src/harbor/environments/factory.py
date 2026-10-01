@@ -178,6 +178,11 @@ _ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
         "MosaicEnvironment",
         "mosaic",
     ),
+    EnvironmentType.GMI: _EnvEntry(
+        "harbor.environments.gmi",
+        "GMIEnvironment",
+        "gmi",
+    ),
 }
 
 
