@@ -238,6 +238,12 @@ def _template_product() -> str:
 class GMIEnvironment(BaseEnvironment):
     """Run Harbor tasks inside a GMI sandbox."""
 
+    # Set with --ek; the HARBOR_GMI_* variables stay as fallbacks.
+    _product: str | None = None
+    _sandbox_timeout_sec: int | None = None
+    # The last create request, so stop() can replay one whose reply was lost.
+    _create_request: dict[str, Any] | None = None
+
     @classmethod
     @override
     def preflight(cls) -> None:
@@ -257,15 +263,19 @@ class GMIEnvironment(BaseEnvironment):
     def __init__(
         self,
         *args: Any,
-        template_id: str | None = None,
+        template_id: str | int | None = None,
+        product: str | None = None,
+        sandbox_timeout_sec: int | None = None,
         **kwargs: Any,
     ) -> None:
         if not _HAS_GMI:
             raise MissingExtraError(package="gmi-sandbox-sdk", extra="gmi")
 
-        self._template_id: str | None = template_id or os.environ.get(
-            _DEFAULT_TEMPLATE_ENV
-        )
+        # --ek parses a numeric template id as an int.
+        template_id = template_id or os.environ.get(_DEFAULT_TEMPLATE_ENV)
+        self._template_id: str | None = str(template_id) if template_id else None
+        self._product = product
+        self._sandbox_timeout_sec = sandbox_timeout_sec
 
         super().__init__(*args, **kwargs)
         self._client = AsyncSandboxClient()
@@ -339,7 +349,9 @@ class GMIEnvironment(BaseEnvironment):
         template_id = self._template_id
         if template_id is None:
             template_id = await self._build_task_template(force_build)
-        timeout = int(os.environ.get(_SANDBOX_TIMEOUT_ENV, _DEFAULT_SANDBOX_TIMEOUT))
+        timeout = self._sandbox_timeout_sec or int(
+            os.environ.get(_SANDBOX_TIMEOUT_ENV, _DEFAULT_SANDBOX_TIMEOUT)
+        )
         self._sandbox = await self._create_sandbox(template_id, timeout)
         self._control_plane_id = self._sandbox.id
         await self._sandbox.wait_until_running(timeout=_READY_TIMEOUT_SEC)
@@ -350,7 +362,9 @@ class GMIEnvironment(BaseEnvironment):
 
     async def _create_sandbox(self, template_id: str, timeout: int) -> Any:
         """Create this trial's sandbox."""
-        return await self._client.sandboxes.create(
+        # Kept for stop(): the server can create the sandbox even when the reply
+        # is lost or the caller is cancelled.
+        request: dict[str, Any] = dict(
             template_id=template_id,
             idc_name=self._idc_name,
             timeout=timeout,
@@ -362,6 +376,8 @@ class GMIEnvironment(BaseEnvironment):
             },
             idempotency_key=str(uuid.uuid4()),
         )
+        self._create_request = request
+        return await self._client.sandboxes.create(**request)
 
     def _template_build_input(
         self, force_build: bool
@@ -397,7 +413,7 @@ class GMIEnvironment(BaseEnvironment):
         build, dockerfile_content, build_context_dir = self._template_build_input(
             force_build
         )
-        resources = {"type": "preset", "product": _template_product()}
+        resources = {"type": "preset", "product": self._product or _template_product()}
         alias = _template_alias(
             self.environment_name, _definition_scope(self.environment_dir)
         )
@@ -590,6 +606,14 @@ class GMIEnvironment(BaseEnvironment):
     async def stop(self, delete: bool) -> None:
         delete_error: Exception | None = None
         try:
+            if self._sandbox is None and delete and self._create_request is not None:
+                try:
+                    # Replaying the idempotency key returns that sandbox, if any.
+                    self._sandbox = await self._client.sandboxes.create(
+                        **self._create_request
+                    )
+                except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+                    self.logger.warning(f"Could not recover the GMI sandbox: {exc}")
             if self._sandbox is None:
                 self.logger.debug("Sandbox has already been removed.")
                 return
@@ -607,6 +631,7 @@ class GMIEnvironment(BaseEnvironment):
                 delete_error = exc
         finally:
             self._sandbox = None
+            self._create_request = None
             try:
                 await self._client.aclose()
             except Exception as exc:  # noqa: BLE001 - teardown must not mask results
